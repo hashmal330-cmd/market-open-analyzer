@@ -6,6 +6,7 @@ import uuid
 import urllib.parse
 import urllib.request
 import ssl
+from collections import Counter, defaultdict
 import requests
 import certifi
 from pathlib import Path
@@ -22,7 +23,7 @@ import plotly.graph_objects as go
 # App setup
 # ============================================================
 
-st.set_page_config(page_title="Paper Trading Lab V6.5 Advanced", page_icon="🧪", layout="wide")
+st.set_page_config(page_title="Paper Trading Lab V6.6 Balanced", page_icon="🧪", layout="wide")
 
 DATA_DIR = Path("paper_data")
 DATA_DIR.mkdir(exist_ok=True)
@@ -31,9 +32,9 @@ TRADES_FILE = DATA_DIR / "trades_v3.csv"
 TICKERS_FILE = DATA_DIR / "tickers_v3.json"
 COSTS_FILE = DATA_DIR / "costs_v3.json"
 UNITS_FILE = DATA_DIR / "units_v3.json"
-RULES_FILE = DATA_DIR / "rules_v6_5.json"
+RULES_FILE = DATA_DIR / "rules_v6_6.json"
 ACCOUNT_FILE = DATA_DIR / "account_v3.json"
-PENDING_FILE = DATA_DIR / "pending_signals_v6_5.csv"
+PENDING_FILE = DATA_DIR / "pending_signals_v6_6.csv"
 ALERTS_FILE = DATA_DIR / "alerts_v5_8.csv"
 ALERT_SETTINGS_FILE = DATA_DIR / "alert_settings_v5_8.json"
 
@@ -68,19 +69,19 @@ DEFAULT_UNITS = {
 DEFAULT_RULES = {
     "min_hold_fast_minutes": 3,
     "min_hold_half_hour_minutes": 10,
-    "cooldown_after_close_minutes": 10,
+    "cooldown_after_close_minutes": 8,
     "max_new_trades_per_scan": 2,
-    "max_open_trades": 4,
-    "max_same_side_open": 2,
+    "max_open_trades": 5,
+    "max_same_side_open": 3,
     "max_same_group_open": 2,
-    "min_direction_score_gap": 3,
-    "min_base_score": 7,
+    "min_direction_score_gap": 2,
+    "min_base_score": 6,
     "require_5m_alignment": True,
-    "min_5m_alignment_score": 3,
+    "min_5m_alignment_score": 2,
     "market_filter_enabled": True,
     "market_reference_ticker": "QQQ",
-    "live_data_max_age_minutes": 6,
-    "entry_start_time": "09:45",
+    "live_data_max_age_minutes": 20,
+    "entry_start_time": "09:40",
     "entry_end_time": "15:25",
     "force_flat_time": "15:55",
 
@@ -91,12 +92,13 @@ DEFAULT_RULES = {
     "loss_streak_pause_minutes": 15,
 
     # Entry confirmation
-    "confirm_before_entry_seconds": 60,
-    "pending_signal_expire_minutes": 5,
+    "confirm_before_entry_seconds": 45,
+    "pending_signal_expire_minutes": 7,
     "confirmation_breakout_buffer_pct": 0.0,
-    "max_adverse_move_r_before_entry": 0.25,
-    "max_target_progress_before_entry_pct": 45.0,
-    "min_confirmation_rel_volume": 0.85,
+    "max_adverse_move_r_before_entry": 0.35,
+    "max_target_progress_before_entry_pct": 55.0,
+    "min_confirmation_rel_volume": 0.50,
+    "confirmation_breakout_tolerance_atr": 0.10,
 
     # Profit-taking and protection
     "cycle_net_profit_target": 50.0,
@@ -110,9 +112,9 @@ DEFAULT_RULES = {
     "profit_giveback_pct": 10.0,
     "min_net_profit_for_giveback": 5.0,
     "use_history_after_minutes": 30,
-    "history_min_samples": 2,
-    "history_max_score_bonus": 2,
-    "history_max_score_penalty": 2,
+    "history_min_samples": 4,
+    "history_max_score_bonus": 1,
+    "history_max_score_penalty": 1,
 }
 
 DEFAULT_ACCOUNT = {
@@ -581,6 +583,7 @@ def add_pending_signal(signal):
     save_pending(pending)
     return True, f"{ticker}: נשמרה מועמדת {signal['signal']} בניקוד {signal.get('score', 0)}; תיבדק שוב אחרי ההמתנה."
 
+
 def process_pending_signals(min_score, max_new_override=None, max_open_override=None):
     pending = load_pending()
     messages = []
@@ -599,17 +602,18 @@ def process_pending_signals(min_score, max_new_override=None, max_open_override=
         save_pending(pending)
         return [risk_msg]
 
-    max_new = int(max_new_override) if max_new_override is not None else int(rules["max_new_trades_per_scan"])
-    max_open = int(max_open_override) if max_open_override is not None else int(rules.get("max_open_trades", 4))
+    max_new = int(max_new_override) if max_new_override is not None else int(rules.get("max_new_trades_per_scan", 2))
+    max_open = int(max_open_override) if max_open_override is not None else int(rules.get("max_open_trades", 5))
     current_open = int(trades["status"].eq("OPEN").sum()) if not trades.empty else 0
     max_to_open = min(max_new, max(0, max_open - current_open))
-    confirm_seconds = float(rules.get("confirm_before_entry_seconds", 60))
-    expire_minutes = float(rules.get("pending_signal_expire_minutes", 5))
+    confirm_seconds = float(rules.get("confirm_before_entry_seconds", 45))
+    expire_minutes = float(rules.get("pending_signal_expire_minutes", 7))
     opened = 0
 
     for idx in pending.index[pending["status"].astype(str).eq("PENDING")].tolist():
         if opened >= max_to_open:
             break
+
         created_at = timestamp_to_ny(pending.loc[idx, "created_at"])
         if created_at is None:
             pending.loc[idx, "status"] = "REJECTED"
@@ -620,11 +624,11 @@ def process_pending_signals(min_score, max_new_override=None, max_open_override=
         pending.loc[idx, "last_checked_at"] = now_ny_iso()
         if age_seconds > expire_minutes * 60:
             pending.loc[idx, "status"] = "EXPIRED"
-            pending.loc[idx, "message"] = "המועמדת פגה."
+            pending.loc[idx, "message"] = "המועמדת פגה כי לא התקבל נר אישור חדש בזמן."
             messages.append(f"{pending.loc[idx, 'ticker']}: המועמדת פגה.")
             continue
         if age_seconds < confirm_seconds:
-            pending.loc[idx, "message"] = f"ממתינים לאישור פריצה; נשארו כ־{int(confirm_seconds-age_seconds)} שניות."
+            pending.loc[idx, "message"] = f"ממתינים לנר אישור; נשארו כ־{int(confirm_seconds-age_seconds)} שניות."
             continue
 
         ticker = str(pending.loc[idx, "ticker"])
@@ -633,6 +637,20 @@ def process_pending_signals(min_score, max_new_override=None, max_open_override=
             new_signal = make_signal(ticker, mode)
         except Exception as exc:
             pending.loc[idx, "message"] = f"שגיאת בדיקה חוזרת: {str(exc)[:100]}"
+            continue
+
+        # Yahoo may not publish a new minute immediately. Keep waiting instead of rejecting.
+        original_bar = timestamp_to_ny(pending.loc[idx, "signal_bar_time"])
+        new_bar = timestamp_to_ny(new_signal.get("signal_bar_time", ""))
+        if new_bar is None or (original_bar is not None and new_bar <= original_bar):
+            pending.loc[idx, "message"] = "עדיין אין נר דקה חדש ב־Yahoo; ממשיכים להמתין."
+            continue
+
+        if new_signal.get("signal") not in ["LONG", "SHORT"]:
+            reason = str(new_signal.get("reason", "האיתות נחלש"))
+            pending.loc[idx, "status"] = "REJECTED"
+            pending.loc[idx, "message"] = f"נדחה בנר החדש: {reason}"
+            messages.append(f"{ticker}: נדחה — {reason}")
             continue
 
         confirmed, confirm_msg = signal_confirmed_after_delay(
@@ -646,26 +664,27 @@ def process_pending_signals(min_score, max_new_override=None, max_open_override=
             signal_high=pending.loc[idx, "signal_high"],
             signal_low=pending.loc[idx, "signal_low"],
         )
+
         if not confirmed:
             pending.loc[idx, "status"] = "REJECTED"
             pending.loc[idx, "message"] = confirm_msg
             messages.append(f"{ticker}: לא נכנסנו — {confirm_msg}")
             continue
 
-        ok, msg = open_trade(new_signal, min_score=min_score)
+        ok, msg = open_trade(new_signal, min_score=max(1, int(min_score) - 1))
         if ok:
             opened += 1
             pending.loc[idx, "status"] = "OPENED"
-            pending.loc[idx, "message"] = "נפתחה אחרי אישור פריצה ו־5 דקות."
-            messages.append(msg)
-            trades = load_trades()
+            pending.loc[idx, "message"] = "נפתחה אחרי נר אישור חדש."
+            messages.append(f"{msg} | נפתחה אחרי אישור מאוזן.")
         else:
             pending.loc[idx, "status"] = "REJECTED"
             pending.loc[idx, "message"] = msg
-            messages.append(f"{ticker}: {msg}")
+            messages.append(f"{ticker}: לא נפתחה — {msg}")
 
     save_pending(pending)
     return messages
+
 
 # ============================================================
 # Alerts / Telegram
@@ -966,8 +985,9 @@ def minute_of_day(ts):
     return int(t.hour) * 60 + int(t.minute)
 
 
+
 def live_data_status(df, for_entry=False):
-    """Prevent scans/exits from using stale bars from a previous session."""
+    """Validate that intraday data belongs to today without over-blocking delayed Yahoo bars."""
     rules = load_rules()
     if df is None or df.empty:
         return False, "אין נתוני שוק."
@@ -981,19 +1001,24 @@ def live_data_status(df, for_entry=False):
     if last_bar.date() != now.date():
         return False, f"הנתון האחרון הוא מ־{last_bar.date()} ולא מהיום."
 
-    max_age = float(rules.get("live_data_max_age_minutes", 6))
+    # Yahoo/yfinance can be several minutes behind on Streamlit Cloud.
+    # We still reject genuinely stale data, but allow a realistic delayed feed.
+    max_age = float(rules.get("live_data_max_age_minutes", 20))
     age_minutes = max(0.0, (now - last_bar).total_seconds() / 60.0)
     if age_minutes > max_age:
-        return False, f"הנר האחרון ישן ב־{age_minutes:.1f} דקות."
+        return False, f"הנר האחרון ישן ב־{age_minutes:.1f} דקות (מקסימום {max_age:.0f})."
 
     if for_entry:
-        start_h, start_m = parse_hhmm(rules.get("entry_start_time", "09:35"), "09:35")
-        end_h, end_m = parse_hhmm(rules.get("entry_end_time", "15:25"), "15:30")
+        start_h, start_m = parse_hhmm(rules.get("entry_start_time", "09:40"), "09:40")
+        end_h, end_m = parse_hhmm(rules.get("entry_end_time", "15:25"), "15:25")
         now_minute = now.hour * 60 + now.minute
         if now_minute < start_h * 60 + start_m or now_minute > end_h * 60 + end_m:
             return False, f"כניסות חדשות מותרות בין {start_h:02d}:{start_m:02d} ל־{end_h:02d}:{end_m:02d} ניו־יורק."
 
+    if age_minutes > 6:
+        return True, f"הנתונים מהיום אך בעיכוב של {age_minutes:.1f} דקות."
     return True, "הנתונים חיים ועדכניים."
+
 
 def add_indicators(df):
     d = df.copy().sort_index()
@@ -1113,28 +1138,42 @@ def market_side_for_ticker(ticker, side):
     return str(side)
 
 
+
 def market_context_check(ticker, side):
+    """Use QQQ as a guardrail, not as an absolute blocker in a neutral market."""
     rules = load_rules()
     if not bool(rules.get("market_filter_enabled", True)):
         return True, "פילטר השוק כבוי."
+
     ref = normalize_ticker(rules.get("market_reference_ticker", "QQQ"))
     try:
         market_df = latest_session(fetch_1m(ref))
     except Exception as exc:
         return False, f"לא ניתן לבדוק את {ref}: {str(exc)[:80]}"
+
     ok, reason = live_data_status(market_df, for_entry=False)
     if not ok:
         return False, f"נתוני {ref} אינם עדכניים: {reason}"
+
     required_side = market_side_for_ticker(ticker, side)
     aligned, aligned_reason = timeframe_alignment_score(market_df, required_side)
     opposite = "SHORT" if required_side == "LONG" else "LONG"
-    opposite_score, _ = timeframe_alignment_score(market_df, opposite)
-    minimum = int(rules.get("min_5m_alignment_score", 3))
-    if aligned < minimum and opposite_score >= minimum:
-        return False, f"{ref} תומך בכיוון ההפוך ({opposite_score}/4)."
-    if aligned < max(2, minimum - 1):
-        return False, f"{ref} ניטרלי/חלש לכיוון העסקה ({aligned}/4)."
-    return True, f"{ref} תומך בכיוון העסקה ({aligned}/4): {aligned_reason}"
+    opposite_score, opposite_reason = timeframe_alignment_score(market_df, opposite)
+    minimum = int(rules.get("min_5m_alignment_score", 2))
+
+    # Reject only when QQQ clearly supports the opposite direction.
+    if opposite_score >= max(3, minimum + 1) and opposite_score >= aligned + 2:
+        return False, (
+            f"{ref} תומך בבירור בכיוון ההפוך: {opposite_score}/4 מול {aligned}/4. "
+            f"{opposite_reason}"
+        )
+
+    if aligned >= minimum:
+        return True, f"{ref} תומך בכיוון העסקה ({aligned}/4): {aligned_reason}"
+
+    # Neutral QQQ no longer blocks every stock-specific setup.
+    return True, f"{ref} ניטרלי ({aligned}/4 מול {opposite_score}/4); העסקה נשענת על המניה עצמה."
+
 
 
 def today_trade_mask(trades):
@@ -1187,10 +1226,10 @@ def exposure_gate(trades, ticker, side, include_pending=True):
     rules = load_rules()
     trades = normalize_trade_dtypes(trades)
     open_df = trades[trades["status"].astype(str).eq("OPEN")].copy() if not trades.empty else trades
-    max_open = int(rules.get("max_open_trades", 4))
+    max_open = int(rules.get("max_open_trades", 5))
     if len(open_df) >= max_open:
         return False, f"כבר יש {len(open_df)} עסקאות פתוחות (מקסימום {max_open})."
-    max_side = int(rules.get("max_same_side_open", 2))
+    max_side = int(rules.get("max_same_side_open", 3))
     side_count = int(open_df["side"].astype(str).eq(str(side)).sum()) if not open_df.empty else 0
     group = ticker_group(ticker)
     group_count = int(open_df["ticker"].apply(ticker_group).eq(group).sum()) if not open_df.empty else 0
@@ -1480,9 +1519,9 @@ def historical_pattern_adjustment(ticker, mode, side, current_session_df, curren
     """
     rules = load_rules()
     after_minutes = float(rules.get("use_history_after_minutes", 30))
-    min_samples = int(rules.get("history_min_samples", 2))
-    max_bonus = int(rules.get("history_max_score_bonus", 2))
-    max_penalty = int(rules.get("history_max_score_penalty", 2))
+    min_samples = int(rules.get("history_min_samples", 4))
+    max_bonus = int(rules.get("history_max_score_bonus", 1))
+    max_penalty = int(rules.get("history_max_score_penalty", 1))
 
     if current_session_df is None or current_session_df.empty:
         return {"delta": 0, "reason": "אין נתוני היסטוריה להשוואה."}
@@ -1716,6 +1755,7 @@ def score_side_half(d, side):
 
     return int(max(1, min(10, score))), reasons
 
+
 def make_signal(ticker, mode):
     ticker = normalize_ticker(ticker)
     df = latest_session(fetch_1m(ticker))
@@ -1740,9 +1780,10 @@ def make_signal(ticker, mode):
         atr = safe_float(d.iloc[-1]["atr14"], safe_float(d.iloc[-1]["close"]) * 0.002)
 
     rules = load_rules()
-    min_gap = int(rules.get("min_direction_score_gap", 3))
-    min_base = int(rules.get("min_base_score", 7))
+    min_gap = int(rules.get("min_direction_score_gap", 2))
+    min_base = int(rules.get("min_base_score", 6))
     score_gap = abs(int(ls) - int(ss))
+
     if ls > ss and ls >= min_base and score_gap >= min_gap:
         side, base_score, reasons = "LONG", ls, lr
     elif ss > ls and ss >= min_base and score_gap >= min_gap:
@@ -1755,11 +1796,12 @@ def make_signal(ticker, mode):
         }
 
     tf5_score, tf5_reason = timeframe_alignment_score(df, side)
-    min_tf5 = int(rules.get("min_5m_alignment_score", 3))
+    min_tf5 = int(rules.get("min_5m_alignment_score", 2))
     if bool(rules.get("require_5m_alignment", True)) and tf5_score < min_tf5:
         return {
             "signal": "WAIT", "ticker": ticker, "mode": mode, "score": int(base_score),
             "long_score": int(ls), "short_score": int(ss), "score_gap": int(score_gap),
+            "tf5_score": int(tf5_score),
             "reason": f"נפסל ב־5 דקות ({tf5_score}/4): {tf5_reason}"
         }
 
@@ -1768,6 +1810,7 @@ def make_signal(ticker, mode):
         return {
             "signal": "WAIT", "ticker": ticker, "mode": mode, "score": int(base_score),
             "long_score": int(ls), "short_score": int(ss), "score_gap": int(score_gap),
+            "tf5_score": int(tf5_score),
             "reason": f"נפסל לפי שוק: {market_reason}"
         }
 
@@ -1776,7 +1819,10 @@ def make_signal(ticker, mode):
     stop = safe_float(chart_plan["stop"])
     target = safe_float(chart_plan["target"])
     hist_adj = historical_pattern_adjustment(ticker, mode, side, d)
-    final_score = int(max(1, min(12, int(base_score) + int(hist_adj.get("delta", 0)))))
+
+    # A strong 5-minute alignment deserves one confidence point.
+    tf_bonus = 1 if tf5_score >= 3 else 0
+    final_score = int(max(1, min(12, int(base_score) + tf_bonus + int(hist_adj.get("delta", 0)))))
     last = d.iloc[-1]
 
     return {
@@ -1797,8 +1843,17 @@ def make_signal(ticker, mode):
         "signal_low": float(last["low"]),
         "signal_bar_time": str(d.index[-1]),
         "last_rel_vol": float(safe_float(last.get("rel_vol5"), 0)),
-        "reason": " | ".join(reasons + [f"5 דקות {tf5_score}/4: {tf5_reason}", market_reason, chart_plan["reason"], hist_adj.get("reason", "")]),
+        "reason": " | ".join(
+            reasons + [
+                live_reason,
+                f"5 דקות {tf5_score}/4: {tf5_reason}",
+                market_reason,
+                chart_plan["reason"],
+                hist_adj.get("reason", ""),
+            ]
+        ),
     }
+
 
 # ============================================================
 # Trade lifecycle
@@ -1852,9 +1907,11 @@ def apply_risk_cap_to_position(side, entry, stop, score_qty, score_notional, max
     return float(qty), float(notional), f"גודל העסקה הוגבל לפי סיכון לסטופ: הפסד מקסימלי משוער ${risk_dollars:.2f}."
 
 
+
 def signal_confirmed_after_delay(original_side, original_score, new_signal, min_score,
                                  original_entry=np.nan, original_stop=np.nan, original_target=np.nan,
                                  signal_high=np.nan, signal_low=np.nan):
+    """Balanced second-stage confirmation using a new bar's high/low, not only its close."""
     rules = load_rules()
     new_side = str(new_signal.get("signal", "WAIT"))
     new_score = int(new_signal.get("score", 0))
@@ -1863,7 +1920,8 @@ def signal_confirmed_after_delay(original_side, original_score, new_signal, min_
     if new_side != original_side:
         return False, f"הכיוון השתנה מ־{original_side} ל־{new_side}."
 
-    required_score = max(int(min_score), int(original_score) - 1)
+    # Allow a small one-minute score fluctuation while keeping the setup strong.
+    required_score = max(6, int(min_score) - 1, int(original_score) - 2)
     if new_score < required_score:
         return False, f"הניקוד ירד מ־{original_score} ל־{new_score}; נדרש לפחות {required_score}."
 
@@ -1873,19 +1931,33 @@ def signal_confirmed_after_delay(original_side, original_score, new_signal, min_
     target = safe_float(original_target, np.nan)
     high = safe_float(signal_high, np.nan)
     low = safe_float(signal_low, np.nan)
-    buffer_pct = float(rules.get("confirmation_breakout_buffer_pct", 0.0)) / 100.0
+    atr = safe_float(new_signal.get("atr"), abs(entry - stop) if np.isfinite(entry) and np.isfinite(stop) else 0.0)
+    new_high = safe_float(new_signal.get("signal_high"), price)
+    new_low = safe_float(new_signal.get("signal_low"), price)
+
+    tolerance_atr = float(rules.get("confirmation_breakout_tolerance_atr", 0.10))
+    tolerance = max(abs(atr) * tolerance_atr, abs(entry) * 0.0001 if np.isfinite(entry) else 0.0)
+    risk = abs(entry - stop) if np.isfinite(entry) and np.isfinite(stop) else max(abs(atr), 0.0)
 
     if original_side == "LONG" and np.isfinite(high):
-        required = high * (1 + buffer_pct)
-        if not np.isfinite(price) or price <= required:
-            return False, f"אין פריצה מאושרת: נדרשת סגירה מעל {required:.2f}."
-    if original_side == "SHORT" and np.isfinite(low):
-        required = low * (1 - buffer_pct)
-        if not np.isfinite(price) or price >= required:
-            return False, f"אין שבירה מאושרת: נדרשת סגירה מתחת {required:.2f}."
+        touched_breakout = np.isfinite(new_high) and new_high >= high - tolerance
+        holding_direction = np.isfinite(price) and price >= entry - risk * 0.05
+        if not (touched_breakout and holding_direction):
+            return False, (
+                f"אין אישור לונג: שיא חדש {new_high:.2f} מול רמת {high:.2f}, "
+                f"מחיר נוכחי {price:.2f}."
+            )
 
-    risk = abs(entry - stop) if np.isfinite(entry) and np.isfinite(stop) else 0.0
-    max_adverse_r = float(rules.get("max_adverse_move_r_before_entry", 0.25))
+    if original_side == "SHORT" and np.isfinite(low):
+        touched_breakdown = np.isfinite(new_low) and new_low <= low + tolerance
+        holding_direction = np.isfinite(price) and price <= entry + risk * 0.05
+        if not (touched_breakdown and holding_direction):
+            return False, (
+                f"אין אישור שורט: שפל חדש {new_low:.2f} מול רמת {low:.2f}, "
+                f"מחיר נוכחי {price:.2f}."
+            )
+
+    max_adverse_r = float(rules.get("max_adverse_move_r_before_entry", 0.35))
     if risk > 0 and np.isfinite(price):
         if original_side == "LONG" and price < entry - risk * max_adverse_r:
             return False, "המחיר זז נגד הלונג בזמן ההמתנה."
@@ -1896,16 +1968,18 @@ def signal_confirmed_after_delay(original_side, original_score, new_signal, min_
         full_move = abs(target - entry)
         progress = ((price - entry) if original_side == "LONG" else (entry - price))
         progress_pct = (progress / full_move) * 100 if full_move > 0 else 0
-        max_progress = float(rules.get("max_target_progress_before_entry_pct", 45.0))
+        max_progress = float(rules.get("max_target_progress_before_entry_pct", 55.0))
         if progress_pct > max_progress:
             return False, f"המחיר כבר עבר {progress_pct:.0f}% מהדרך ליעד; לא רודפים אחרי העסקה."
 
-    rel_vol = safe_float(new_signal.get("last_rel_vol"), 0)
-    min_rel_vol = float(rules.get("min_confirmation_rel_volume", 0.85))
-    if rel_vol < min_rel_vol:
-        return False, f"ווליום האישור חלש ({rel_vol:.2f}); נדרש {min_rel_vol:.2f}."
+    rel_vol = safe_float(new_signal.get("last_rel_vol"), np.nan)
+    min_rel_vol = float(rules.get("min_confirmation_rel_volume", 0.50))
+    # Missing/partial volume should not block a very strong setup; clearly weak volume still does.
+    if np.isfinite(rel_vol) and rel_vol < min_rel_vol and new_score < max(9, original_score):
+        return False, f"ווליום האישור חלש ({rel_vol:.2f}); נדרש {min_rel_vol:.2f} או ניקוד חזק במיוחד."
 
-    return True, "הכיוון, הניקוד, הפריצה והווליום אושרו."
+    return True, "הכיוון, הניקוד והמשך המחיר אושרו בנר חדש."
+
 
 def in_cooldown(trades, ticker, mode, rules):
     if trades.empty:
@@ -2388,6 +2462,7 @@ def close_trade_manually(trade_id):
     return True, f"{ticker}: נסגר ידנית במחיר {current:.2f}. נטו ${pnl['net_pnl']:.2f}"
 
 
+
 def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_override=None):
     messages = []
     rules = load_rules()
@@ -2397,7 +2472,7 @@ def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_ove
         return [risk_msg]
 
     max_new = int(max_new_override) if max_new_override is not None else int(rules.get("max_new_trades_per_scan", 2))
-    max_open = int(max_open_override) if max_open_override is not None else int(rules.get("max_open_trades", 4))
+    max_open = int(max_open_override) if max_open_override is not None else int(rules.get("max_open_trades", 5))
     current_open = int(trades["status"].eq("OPEN").sum()) if not trades.empty else 0
     active_pending = load_pending()
     pending_count = int(active_pending["status"].astype(str).eq("PENDING").sum()) if not active_pending.empty else 0
@@ -2406,20 +2481,67 @@ def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_ove
         return [f"אין מקום: {current_open} פתוחות + {pending_count} ממתינות, מקסימום {max_open}."]
 
     candidates = []
+    rejection_counts = Counter()
+    rejection_examples = defaultdict(list)
+
+    def rejection_category(reason):
+        r = str(reason)
+        if "ישן" in r or "לא מהיום" in r or "אין נתוני" in r:
+            return "נתונים חסרים/מעוכבים"
+        if "כניסות חדשות מותרות" in r or "סוף שבוע" in r:
+            return "מחוץ לשעות הכניסה"
+        if "נפסל ב־5 דקות" in r or "5 דקות אינן" in r:
+            return "אי־התאמה ב־5 דקות"
+        if "נפסל לפי שוק" in r or "כיוון ההפוך" in r:
+            return "QQQ בכיוון מנוגד"
+        if "נדרש בסיס" in r or "נדרש" in r and "פער" in r:
+            return "ניקוד בסיס/פער כיוונים"
+        return "סינון אחר"
+
     for ticker in tickers:
         for mode in modes:
             try:
                 sig = make_signal(ticker, mode)
-                if sig.get("signal") not in ["LONG", "SHORT"] or int(sig.get("score", 0)) < int(min_score):
+                if sig.get("signal") not in ["LONG", "SHORT"]:
+                    reason = str(sig.get("reason", "אין איתות"))
+                    category = rejection_category(reason)
+                    rejection_counts[category] += 1
+                    if len(rejection_examples[category]) < 4:
+                        rejection_examples[category].append(f"{ticker}: {reason}")
                     continue
+                if int(sig.get("score", 0)) < int(min_score):
+                    category = "ציון סופי נמוך"
+                    rejection_counts[category] += 1
+                    if len(rejection_examples[category]) < 4:
+                        rejection_examples[category].append(
+                            f"{ticker}: ציון {sig.get('score', 0)} מתחת לסף {min_score}"
+                        )
+                    continue
+
                 expected_move_pct = abs(float(sig["target"]) - float(sig["entry"])) / float(sig["entry"]) * 100
-                candidates.append((int(sig["score"]), int(sig.get("score_gap", 0)), int(sig.get("tf5_score", 0)), expected_move_pct, sig))
+                candidates.append((
+                    int(sig["score"]),
+                    int(sig.get("score_gap", 0)),
+                    int(sig.get("tf5_score", 0)),
+                    expected_move_pct,
+                    sig,
+                ))
             except Exception as exc:
-                messages.append(f"{ticker} | {mode}: {str(exc)[:100]}")
+                category = "שגיאת סריקה"
+                rejection_counts[category] += 1
+                if len(rejection_examples[category]) < 4:
+                    rejection_examples[category].append(f"{ticker}: {str(exc)[:120]}")
             time.sleep(0.03)
 
     if not candidates:
-        return messages + ["לא נמצאו עסקאות שעברו דקה, 5 דקות, QQQ וניקוד מינימלי."]
+        messages.append("לא נמצאה כרגע עסקה שעברה את כל הסינון.")
+        if rejection_counts:
+            summary = " | ".join(f"{name}: {count}" for name, count in rejection_counts.most_common())
+            messages.append(f"אבחון פסילות — {summary}")
+            for category, _ in rejection_counts.most_common(4):
+                for example in rejection_examples[category]:
+                    messages.append(f"[{category}] {example}")
+        return messages
 
     candidates.sort(key=lambda x: (x[0], x[1], x[2], x[3]), reverse=True)
     saved = 0
@@ -2430,9 +2552,13 @@ def scan_and_open(tickers, modes, min_score, max_new_override=None, max_open_ove
         messages.append(msg)
         if ok:
             saved += 1
+
     if saved:
-        messages.append(f"נשמרו {saved} מועמדות איכותיות לאישור פריצה.")
+        messages.append(f"נשמרו {saved} מועמדות לאישור בנר הבא מתוך {len(candidates)} שעברו סינון.")
+    elif candidates:
+        messages.append(f"נמצאו {len(candidates)} מועמדות, אך מגבלות החשיפה/המתנה מנעו שמירה חדשה.")
     return messages
+
 
 # ============================================================
 # Summary + display
@@ -2803,47 +2929,86 @@ def render_closed_trades(closed_trades):
 # Backtest / historical replay
 # ============================================================
 
+
 def make_signal_from_history(ticker, mode, hist_df, market_hist_df=None):
     if hist_df is None or hist_df.empty:
         return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "אין נתונים"}
     d = add_indicators(hist_df).dropna(subset=["close"])
     if d.empty:
         return {"signal": "WAIT", "ticker": ticker, "mode": mode, "score": 0, "reason": "אין אינדיקטורים"}
+
     if mode == "מהירה":
-        ls, lr = score_side_fast(d, "LONG"); ss, sr = score_side_fast(d, "SHORT")
+        ls, lr = score_side_fast(d, "LONG")
+        ss, sr = score_side_fast(d, "SHORT")
         atr = safe_float(d.iloc[-1]["atr3"], safe_float(d.iloc[-1]["close"]) * 0.001)
     else:
-        ls, lr = score_side_half(d, "LONG"); ss, sr = score_side_half(d, "SHORT")
+        ls, lr = score_side_half(d, "LONG")
+        ss, sr = score_side_half(d, "SHORT")
         atr = safe_float(d.iloc[-1]["atr14"], safe_float(d.iloc[-1]["close"]) * 0.002)
-    rules = load_rules(); gap = abs(ls-ss); min_gap = int(rules.get("min_direction_score_gap", 3)); min_base = int(rules.get("min_base_score", 7))
+
+    rules = load_rules()
+    gap = abs(ls - ss)
+    min_gap = int(rules.get("min_direction_score_gap", 2))
+    min_base = int(rules.get("min_base_score", 6))
     if ls > ss and ls >= min_base and gap >= min_gap:
         side, base, reasons = "LONG", ls, lr
     elif ss > ls and ss >= min_base and gap >= min_gap:
         side, base, reasons = "SHORT", ss, sr
     else:
-        return {"signal":"WAIT","ticker":normalize_ticker(ticker),"mode":mode,"score":max(ls,ss),"reason":"אין יתרון כיוון מספיק"}
+        return {
+            "signal": "WAIT", "ticker": normalize_ticker(ticker), "mode": mode,
+            "score": max(ls, ss), "reason": "אין יתרון כיוון מספיק"
+        }
+
     tf5, tf5_reason = timeframe_alignment_score(hist_df, side)
-    if bool(rules.get("require_5m_alignment", True)) and tf5 < int(rules.get("min_5m_alignment_score", 3)):
-        return {"signal":"WAIT","ticker":normalize_ticker(ticker),"mode":mode,"score":base,"reason":f"5 דקות {tf5}/4"}
+    if bool(rules.get("require_5m_alignment", True)) and tf5 < int(rules.get("min_5m_alignment_score", 2)):
+        return {
+            "signal": "WAIT", "ticker": normalize_ticker(ticker), "mode": mode,
+            "score": base, "reason": f"5 דקות {tf5}/4"
+        }
+
+    market_reason = "QQQ לא זמין בבקטסט"
     if market_hist_df is not None and not market_hist_df.empty and bool(rules.get("market_filter_enabled", True)):
         required_side = market_side_for_ticker(ticker, side)
-        mscore, _ = timeframe_alignment_score(market_hist_df, required_side)
-        opposite, _ = timeframe_alignment_score(market_hist_df, "SHORT" if required_side == "LONG" else "LONG")
-        if mscore < max(2, int(rules.get("min_5m_alignment_score", 3))-1) or opposite > mscore:
-            return {"signal":"WAIT","ticker":normalize_ticker(ticker),"mode":mode,"score":base,"reason":"QQQ לא תומך"}
+        mscore, mreason = timeframe_alignment_score(market_hist_df, required_side)
+        opposite, oreason = timeframe_alignment_score(
+            market_hist_df, "SHORT" if required_side == "LONG" else "LONG"
+        )
+        minimum = int(rules.get("min_5m_alignment_score", 2))
+        if opposite >= max(3, minimum + 1) and opposite >= mscore + 2:
+            return {
+                "signal": "WAIT", "ticker": normalize_ticker(ticker), "mode": mode,
+                "score": base, "reason": f"QQQ בכיוון מנוגד {opposite}/4 מול {mscore}/4"
+            }
+        market_reason = f"QQQ {mscore}/4 מול הפוך {opposite}/4: {mreason or oreason}"
+
     plan = chart_based_stop_target(d, side, mode)
     hist_adj = historical_pattern_adjustment(ticker, mode, side, d, current_time=d.index[-1])
-    score = int(max(1, min(12, base + int(hist_adj.get("delta", 0)))))
+    tf_bonus = 1 if tf5 >= 3 else 0
+    score = int(max(1, min(12, base + tf_bonus + int(hist_adj.get("delta", 0)))))
     last = d.iloc[-1]
     return {
-        "signal":side,"ticker":normalize_ticker(ticker),"mode":mode,"score":score,
-        "long_score":ls,"short_score":ss,"score_gap":gap,"tf5_score":tf5,
-        "entry":float(last["close"]),"stop":float(plan["stop"]),"target":float(plan["target"]),
-        "atr":float(max(atr, float(last["close"])*0.0008)),"signal_high":float(last["high"]),
-        "signal_low":float(last["low"]),"signal_bar_time":str(d.index[-1]),
-        "last_rel_vol":float(safe_float(last.get("rel_vol5"),0)),
-        "reason":" | ".join(reasons+[f"5 דקות {tf5}/4: {tf5_reason}",plan.get("reason",""),hist_adj.get("reason","")])
+        "signal": side,
+        "ticker": normalize_ticker(ticker),
+        "mode": mode,
+        "score": score,
+        "long_score": ls,
+        "short_score": ss,
+        "score_gap": gap,
+        "tf5_score": tf5,
+        "entry": float(last["close"]),
+        "stop": float(plan["stop"]),
+        "target": float(plan["target"]),
+        "atr": float(max(atr, float(last["close"]) * 0.0008)),
+        "signal_high": float(last["high"]),
+        "signal_low": float(last["low"]),
+        "signal_bar_time": str(d.index[-1]),
+        "last_rel_vol": float(safe_float(last.get("rel_vol5"), 0)),
+        "reason": " | ".join(
+            reasons + [f"5 דקות {tf5}/4: {tf5_reason}", market_reason, plan.get("reason", ""), hist_adj.get("reason", "")]
+        ),
     }
+
 
 def backtest_has_open_ticker(open_trades, ticker):
     return any(t["status"] == "OPEN" and str(t["ticker"]) == str(ticker) for t in open_trades)
@@ -3182,7 +3347,7 @@ def backtest_risk_gate(open_trades, closed_trades, current_time, total_opened, r
 
 
 def backtest_exposure_ok(open_trades, pending, ticker, side, rules, include_pending=True):
-    max_side = int(rules.get("max_same_side_open", 2))
+    max_side = int(rules.get("max_same_side_open", 3))
     max_group = int(rules.get("max_same_group_open", 2))
     side_count = sum(1 for t in open_trades if str(t.get("side")) == str(side))
     group = ticker_group(ticker)
@@ -3508,8 +3673,8 @@ except Exception:
 st.markdown(
     """
 <div class="title-box">
-<h1>🧪 Paper Trading Lab V6.5 Advanced</h1>
-<p>גרסה מתקדמת: אימות דקה ו־5 דקות, פילטר QQQ, ציון 0–12, הגנת הפסד יומית ומגבלת סקטורים.</p>
+<h1>🧪 Paper Trading Lab V6.6 Balanced</h1>
+<p>גרסה מאוזנת: דקה + 5 דקות + QQQ, עם אבחון מלא של כל פסילה וסינון שאינו חוסם את כל השוק.</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -3532,7 +3697,7 @@ with tab_paper:
     st.markdown("<div class='card warn'><strong>בדמו בלבד:</strong> אין חיבור לברוקר ואין כסף אמיתי.</div>", unsafe_allow_html=True)
 
     trades, update_msgs = update_open_trades()
-    pending_msgs = process_pending_signals(min_score=int(st.session_state.get("paper_min_score", 9)))
+    pending_msgs = process_pending_signals(min_score=int(st.session_state.get("paper_min_score", 8)))
     update_msgs.extend(pending_msgs)
     trades = load_trades()
 
@@ -3559,7 +3724,7 @@ with tab_paper:
 
     with b:
         modes = st.multiselect("סוג השקעה", ["מהירה", "חצי שעה"], default=["חצי שעה"])
-        min_score = st.slider("מינימום ניקוד לפתיחה", 1, 12, 9, key="paper_min_score")
+        min_score = st.slider("מינימום ניקוד לפתיחה", 1, 12, 8, key="paper_min_score")
         max_new_now = st.number_input("כמה עסקאות חדשות לפתוח בסריקה", 1, 20, 2, key="paper_max_new_trades_now")
         max_open_now = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, 4, key="paper_max_open_trades_now")
 
@@ -3705,16 +3870,16 @@ with tab_rules:
         min_hold_half = st.number_input("מינימום החזקה לעסקת חצי שעה, בדקות", 0, 120, int(rules["min_hold_half_hour_minutes"]))
         cooldown = st.number_input("Cooldown אחרי סגירה, בדקות", 0, 120, int(rules["cooldown_after_close_minutes"]))
         max_new = st.number_input("מקסימום עסקאות חדשות בכל סריקה", 1, 20, int(rules["max_new_trades_per_scan"]), key="rules_max_new_trades")
-        max_open_rule = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, int(rules.get("max_open_trades", 4)), key="rules_max_open_trades")
-        max_same_side = st.number_input("מקסימום עסקאות באותו כיוון", 1, 20, int(rules.get("max_same_side_open", 2)))
+        max_open_rule = st.number_input("מקסימום עסקאות פתוחות במקביל", 1, 30, int(rules.get("max_open_trades", 5)), key="rules_max_open_trades")
+        max_same_side = st.number_input("מקסימום עסקאות באותו כיוון", 1, 20, int(rules.get("max_same_side_open", 3)))
         max_same_group = st.number_input("מקסימום עסקאות מאותה קבוצה/סקטור", 1, 10, int(rules.get("max_same_group_open", 2)))
-        min_base_score = st.number_input("ניקוד טכני בסיסי מינימלי (0–10)", 1, 10, int(rules.get("min_base_score", 7)))
-        min_5m_score = st.number_input("מינימום התאמת 5 דקות (0–4)", 0, 4, int(rules.get("min_5m_alignment_score", 3)))
+        min_base_score = st.number_input("ניקוד טכני בסיסי מינימלי (0–10)", 1, 10, int(rules.get("min_base_score", 6)))
+        min_5m_score = st.number_input("מינימום התאמת 5 דקות (0–4)", 0, 4, int(rules.get("min_5m_alignment_score", 2)))
         daily_loss_limit = st.number_input("עצירת כניסות בהפסד יומי ($)", 1.0, 10000.0, float(rules.get("daily_loss_limit_dollars", 25.0)), 1.0)
         max_trades_day = st.number_input("מקסימום עסקאות ביום", 1, 200, int(rules.get("max_trades_per_day", 18)))
         max_loss_streak = st.number_input("הפסדים רצופים לפני הפסקה", 1, 10, int(rules.get("max_consecutive_losses", 3)))
         loss_pause = st.number_input("משך הפסקה אחרי רצף הפסדים, דקות", 1, 120, int(rules.get("loss_streak_pause_minutes", 15)))
-        direction_gap = st.number_input("פער ניקוד מינימלי בין לונג לשורט", 1, 10, int(rules.get("min_direction_score_gap", 3)))
+        direction_gap = st.number_input("פער ניקוד מינימלי בין לונג לשורט", 1, 10, int(rules.get("min_direction_score_gap", 2)))
         cycle_target = st.number_input("יעד רווח נטו למחזור ($)", 1.0, 10000.0, float(rules["cycle_net_profit_target"]), 1.0, key="rules_cycle_target")
 
     with r2:
@@ -3725,17 +3890,17 @@ with tab_rules:
         max_loss = st.number_input("מקסימום הפסד נטו לעסקה ($)", 1.0, 10000.0, float(rules["max_allowed_loss_per_trade_dollars"]), 1.0)
         giveback_pct = st.number_input("יציאה אם ירד X% מהרווח המקסימלי", 1.0, 90.0, float(rules.get("profit_giveback_pct", 10.0)), 1.0)
         min_giveback_profit = st.number_input("מינימום רווח נטו להפעלת ירידת רווח ($)", 0.0, 1000.0, float(rules.get("min_net_profit_for_giveback", 5.0)), 1.0)
-        confirm_seconds = st.number_input("כמה שניות לחכות לפני כניסה אחרי זיהוי עסקה", 10, 600, int(rules.get("confirm_before_entry_seconds", 60)))
-        pending_expire = st.number_input("אחרי כמה דקות מועמדת פגה", 1, 60, int(rules.get("pending_signal_expire_minutes", 5)))
-        max_adverse_r = st.number_input("תזוזה נגדית מקסימלית בזמן אישור (R)", 0.0, 2.0, float(rules.get("max_adverse_move_r_before_entry", 0.25)), 0.05)
-        max_target_progress = st.number_input("מקסימום אחוז מהדרך ליעד לפני כניסה", 5.0, 100.0, float(rules.get("max_target_progress_before_entry_pct", 45.0)), 5.0)
-        min_confirm_volume = st.number_input("ווליום יחסי מינימלי באישור", 0.0, 5.0, float(rules.get("min_confirmation_rel_volume", 0.85)), 0.05)
+        confirm_seconds = st.number_input("כמה שניות לחכות לפני כניסה אחרי זיהוי עסקה", 10, 600, int(rules.get("confirm_before_entry_seconds", 45)))
+        pending_expire = st.number_input("אחרי כמה דקות מועמדת פגה", 1, 60, int(rules.get("pending_signal_expire_minutes", 7)))
+        max_adverse_r = st.number_input("תזוזה נגדית מקסימלית בזמן אישור (R)", 0.0, 2.0, float(rules.get("max_adverse_move_r_before_entry", 0.35)), 0.05)
+        max_target_progress = st.number_input("מקסימום אחוז מהדרך ליעד לפני כניסה", 5.0, 100.0, float(rules.get("max_target_progress_before_entry_pct", 55.0)), 5.0)
+        min_confirm_volume = st.number_input("ווליום יחסי מינימלי באישור", 0.0, 5.0, float(rules.get("min_confirmation_rel_volume", 0.50)), 0.05)
         history_after = st.number_input("להפעיל היסטוריה אחרי כמה דקות מהפתיחה", 0, 240, int(rules.get("use_history_after_minutes", 30)))
-        history_min_samples = st.number_input("מינימום ימים דומים להשפעה היסטורית", 1, 10, int(rules.get("history_min_samples", 2)))
-        history_bonus = st.number_input("מקסימום תוספת ניקוד מהיסטוריה", 0, 4, int(rules.get("history_max_score_bonus", 2)))
-        history_penalty = st.number_input("מקסימום הורדת ניקוד מהיסטוריה", 0, 4, int(rules.get("history_max_score_penalty", 2)))
-        live_data_age = st.number_input("גיל מקסימלי לנר חי, בדקות", 1, 30, int(rules.get("live_data_max_age_minutes", 6)))
-        entry_start = st.text_input("שעת התחלת כניסות ניו־יורק", value=str(rules.get("entry_start_time", "09:45")))
+        history_min_samples = st.number_input("מינימום ימים דומים להשפעה היסטורית", 1, 10, int(rules.get("history_min_samples", 4)))
+        history_bonus = st.number_input("מקסימום תוספת ניקוד מהיסטוריה", 0, 4, int(rules.get("history_max_score_bonus", 1)))
+        history_penalty = st.number_input("מקסימום הורדת ניקוד מהיסטוריה", 0, 4, int(rules.get("history_max_score_penalty", 1)))
+        live_data_age = st.number_input("גיל מקסימלי לנר חי, בדקות", 1, 30, int(rules.get("live_data_max_age_minutes", 20)))
+        entry_start = st.text_input("שעת התחלת כניסות ניו־יורק", value=str(rules.get("entry_start_time", "09:40")))
         entry_end = st.text_input("שעת סיום כניסות ניו־יורק", value=str(rules.get("entry_end_time", "15:25")))
         force_flat = st.text_input("שעת סגירת כל העסקאות ניו־יורק", value=str(rules.get("force_flat_time", "15:55")))
         exit_score_below = st.slider("לצאת ביעד אם ניקוד נמוך מ־", 1, 13, int(rules["exit_on_target_when_score_below"]))
@@ -4021,7 +4186,7 @@ with tab_backtest:
             "מינימום ניקוד בבקטסט",
             1,
             12,
-            9,
+            8,
             key="bt_min_score",
         )
 
